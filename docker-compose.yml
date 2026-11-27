@@ -1,0 +1,128 @@
+# Ambiente do pipeline de preços da ShopBrasil
+# Airflow 2.9.3 (LocalExecutor) + PostgreSQL (metadados e base analítica)
+#
+#   docker compose up -d      sobe o ambiente
+#   docker compose down       derruba e mantém os dados
+#   docker compose down -v    derruba e apaga os dados
+#
+# As senhas abaixo servem apenas para o ambiente local da atividade.
+
+name: shopbrasil
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-meta/airflow
+    AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLt0nfd7cA="
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Sao_Paulo
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "shopbrasil-secret-key"
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: America/Sao_Paulo
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+
+services:
+  # Banco interno do Airflow
+  postgres-meta:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-meta-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  # Base analítica, onde o pipeline grava as métricas
+  postgres-analytics:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics123
+      POSTGRES_DB: shopbrasil
+    volumes:
+      - postgres-analytics-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "analytics", "-d", "shopbrasil"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  # Roda uma vez: prepara o Airflow, cria o usuário, a Connection e o Pool
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname ShopBrasil \
+          --role Admin \
+          --email admin@shopbrasil.local \
+          --password admin
+        airflow connections delete postgres_analytics || true
+        airflow connections add postgres_analytics \
+          --conn-type postgres \
+          --conn-host postgres-analytics \
+          --conn-login analytics \
+          --conn-password analytics123 \
+          --conn-schema shopbrasil \
+          --conn-port 5432
+        airflow pools set ecommerce_pool 2 "Limita o calculo de metricas por categoria"
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-analytics:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-meta-data:
+  postgres-analytics-data:
